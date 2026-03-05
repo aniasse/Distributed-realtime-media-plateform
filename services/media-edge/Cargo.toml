@@ -8,9 +8,10 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"
 bytes = "1.0"
 log = "0.4"
-uuid = { version = "1.0", features = ["v4", "serde"] }
-serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
 
 [dependencies.shared]
 path = "../../shared"
+
+[[bin]]
+name = "drmp-media-edge"
+path = "src/main.rs"

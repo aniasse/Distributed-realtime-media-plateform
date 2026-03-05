@@ -36,6 +36,28 @@ impl RecordingService {
         // Initialize storage
         self.storage.initialize().await?;
         
+        // Start background cleanup task
+        let rooms = self.rooms.clone();
+        let tracks = self.tracks.clone();
+        tokio::spawn(async move {
+            loop {
+                // Cleanup old recordings
+                {
+                    let mut rooms = rooms.lock().await;
+                    let now = chrono::Utc::now();
+                    rooms.retain(|_, room| (now - room.created_at).num_days() < 30);
+                }
+                
+                // Cleanup unused tracks
+                {
+                    let mut tracks = tracks.lock().await;
+                    tracks.retain(|_, _| true); // Add actual cleanup logic
+                }
+                
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        
         Ok(())
     }
 
@@ -78,34 +100,62 @@ impl RecordingService {
     pub async fn record_packet(&self, packet: RTPPacket, room_id: Uuid) -> Result<(), RecordingError> {
         self.logger.debug(&format!("Recording packet for room {}", room_id));
         
-        // Find the track
-        let tracks = self.tracks.lock().unwrap();
-        if let Some(track) = tracks.values().find(|t| t.ssrc == packet.ssrc) {
-            // Create segment file
-            let segment_file = format!("/recordings/{}/{}_{}.rtp", room_id, track.id, packet.sequence_number);
-            
-            // Write packet to file
-            let data = bincode::serialize(&packet).map_err(|e| RecordingError::SerializationError(e))?;
-            
-            self.storage.save_segment(room_id, data).await.map_err(|e| RecordingError::StorageError(e))?;
-            
-            self.metrics.increment_counter("packets_recorded", 1);
-            Ok(())
-        } else {
-            Err(RecordingError::TrackNotFound)
+        // Use bounded channel for backpressure
+        let (tx, mut rx) = mpsc::channel(1000);
+        
+        // Spawn recording task
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                // Find the track
+                let tracks = self.tracks.lock().unwrap();
+                if let Some(track) = tracks.values().find(|t| t.ssrc == packet.ssrc) {
+                    // Create segment file
+                    let segment_file = format!("/recordings/{}/{}_{}.rtp", room_id, track.id, packet.sequence_number);
+                    
+                    // Write packet to file
+                    let data = bincode::serialize(&packet).map_err(|e| RecordingError::SerializationError(e))?;
+                    
+                    if let Err(e) = self.storage.save_segment(room_id, data).await {
+                        self.error_handler.handle_error(&e, "save_segment");
+                    }
+                }
+            }
+        });
+        
+        // Send packet to recording task
+        if tx.send(packet).await.is_err() {
+            return Err(RecordingError::InternalError);
         }
+        
+        self.metrics.increment_counter("packets_recorded", 1);
+        Ok(())
     }
 
     pub async fn record_rtcp(&self, packet: RTCPPacket, room_id: Uuid) -> Result<(), RecordingError> {
         self.logger.debug(&format!("Recording RTCP packet for room {}", room_id));
         
-        // Create RTCP segment file
-        let segment_file = format!("/recordings/{}/rtcp_{}.rtcp", room_id, packet.sender_ssrc);
+        // Use bounded channel for backpressure
+        let (tx, mut rx) = mpsc::channel(1000);
         
-        // Write RTCP packet to file
-        let data = bincode::serialize(&packet).map_err(|e| RecordingError::SerializationError(e))?;
+        // Spawn recording task
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                // Create RTCP segment file
+                let segment_file = format!("/recordings/{}/rtcp_{}.rtcp", room_id, packet.sender_ssrc);
+                
+                // Write RTCP packet to file
+                let data = bincode::serialize(&packet).map_err(|e| RecordingError::SerializationError(e))?;
+                
+                if let Err(e) = self.storage.save_segment(room_id, data).await {
+                    self.error_handler.handle_error(&e, "save_segment");
+                }
+            }
+        });
         
-        self.storage.save_segment(room_id, data).await.map_err(|e| RecordingError::StorageError(e))?;
+        // Send packet to recording task
+        if tx.send(packet).await.is_err() {
+            return Err(RecordingError::InternalError);
+        }
         
         self.metrics.increment_counter("rtcp_packets_recorded", 1);
         Ok(())
@@ -134,20 +184,30 @@ impl RecordingService {
     pub async fn list_recordings(&self) -> Result<Vec<RecordingInfo>, RecordingError> {
         self.logger.info("Listing all recordings");
         
-        let rooms = self.rooms.lock().unwrap();
-        let mut recordings = Vec::new();
+        // Use parallel processing for room info
+        let rooms = self.rooms.lock().await;
+        let tasks: Vec<_> = rooms.iter().map(|(room_id, room)| {
+            let tracks = self.tracks.clone();
+            tokio::spawn(async move {
+                let tracks = tracks.lock().await;
+                let track_count = tracks.len();
+                let duration = chrono::Utc::now() - room.created_at;
+                
+                Ok(RecordingInfo {
+                    room_id: *room_id,
+                    track_count: track_count as u32,
+                    duration_seconds: duration.num_seconds() as u32,
+                    status: room.state.clone(),
+                })
+            })
+        }).collect();
         
-        for (room_id, room) in rooms.iter() {
-            let tracks = self.tracks.lock().unwrap();
-            let track_count = tracks.len();
-            let duration = chrono::Utc::now() - room.created_at;
-            
-            recordings.push(RecordingInfo {
-                room_id: *room_id,
-                track_count: track_count as u32,
-                duration_seconds: duration.num_seconds() as u32,
-                status: room.state.clone(),
-            });
+        // Wait for all tasks
+        let mut recordings = Vec::new();
+        for task in tasks {
+            if let Ok(info) = task.await? {
+                recordings.push(info);
+            }
         }
         
         Ok(recordings)

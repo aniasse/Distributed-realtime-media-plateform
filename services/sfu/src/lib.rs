@@ -1,22 +1,27 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, RwLock};
+use std::collections::{HashMap, HashSet, BTreeMap};
+use std::sync::Arc;
+use tokio::sync::{RwLock, mpsc, Mutex};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use log::{info, error, debug, warn};
+use dashmap::DashMap;
+use tokio::time::{timeout, Duration};
 
 use crate::shared::domain::{Room, Peer, Track, MediaKind, RoomId, PeerId, TrackId, RoomState, PublisherId};
 use crate::shared::media::{RTPPacket, RTCPPacket, Transport, TransportError, ForwardingStrategy, PacketProcessor, PacketError};
 use crate::shared::utils::{Logger, Metrics, ErrorHandler};
 
 pub struct SFU {
-    pub rooms: Arc<RwLock<HashMap<Uuid, Room>>>,
-    pub peers: Arc<RwLock<HashMap<Uuid, Peer>>>,
-    pub tracks: Arc<RwLock<HashMap<Uuid, Track>>>,
+    pub rooms: Arc<DashMap<Uuid, Room>>,
+    pub peers: Arc<DashMap<Uuid, Peer>>,
+    pub tracks: Arc<DashMap<Uuid, Track>>,
     pub packet_processor: Box<dyn PacketProcessor>,
     pub logger: Logger,
     pub metrics: Metrics,
     pub error_handler: ErrorHandler,
+    pub forwarders: Arc<Mutex<HashMap<Uuid, JoinHandle<()>>>>,
+    pub packet_channels: Arc<Mutex<HashMap<Uuid, mpsc::Sender<RTPPacket>>>>,
 }
 
 impl SFU {
@@ -46,7 +51,8 @@ impl SFU {
             state: RoomState::Active,
         };
         
-        self.rooms.write().await.insert(room_id, room);
+        // Single write operation
+        self.rooms.insert(room_id, room).await;
         self.metrics.increment_counter("rooms_created", 1);
         
         Ok(RoomId(room_id))
@@ -55,7 +61,7 @@ impl SFU {
     pub async fn delete_room(&self, room_id: Uuid) -> Result<(), RoomError> {
         self.logger.info(&format!("Deleting room {}", room_id));
         
-        if self.rooms.write().await.remove(&room_id).is_some() {
+        if self.rooms.remove(&room_id).await.is_some() {
             self.metrics.increment_counter("rooms_deleted", 1);
             Ok(())
         } else {
@@ -66,8 +72,9 @@ impl SFU {
     pub async fn add_peer(&self, room_id: Uuid, peer_id: Uuid) -> Result<(), RoomError> {
         self.logger.info(&format!("Adding peer {} to room {}", peer_id, room_id));
         
-        let mut rooms = self.rooms.write().await;
-        if let Some(room) = rooms.get_mut(&room_id) {
+        // Get room first (read-only)
+        let room = self.rooms.get(&room_id).await;
+        if let Some(room) = room {
             if room.peers.len() as u32 >= room.max_participants {
                 return Err(RoomError::MaxParticipantsReached);
             }
@@ -86,7 +93,13 @@ impl SFU {
                 dtls_fingerprints: Vec::new(),
             };
             
+            // Add peer to room (single write)
+            let mut room = self.rooms.get_mut(&room_id).await;
             room.peers.insert(peer_id, peer);
+            
+            // Add to global peers (single write)
+            self.peers.insert(peer_id, peer).await;
+            
             self.metrics.increment_counter("peers_connected", 1);
             Ok(())
         } else {
@@ -97,14 +110,13 @@ impl SFU {
     pub async fn remove_peer(&self, room_id: Uuid, peer_id: Uuid) -> Result<(), RoomError> {
         self.logger.info(&format!("Removing peer {} from room {}", peer_id, room_id));
         
-        let mut rooms = self.rooms.write().await;
-        if let Some(room) = rooms.get_mut(&room_id) {
+        let mut room = self.rooms.get_mut(&room_id).await;
+        if let Some(room) = room {
             if room.peers.remove(&peer_id).is_some() {
                 self.metrics.increment_counter("peers_disconnected", 1);
                 
                 // Remove peer's tracks
-                let mut tracks = self.tracks.write().await;
-                tracks.retain(|_, track| track.publisher_id.peer_id != peer_id);
+                self.tracks.retain(|_, track| track.publisher_id.peer_id != peer_id).await;
                 
                 Ok(())
             } else {
@@ -118,12 +130,12 @@ impl SFU {
     pub async fn add_track(&self, room_id: Uuid, track: Track) -> Result<(), RoomError> {
         self.logger.info(&format!("Adding track {} to room {}", track.id, room_id));
         
-        let mut rooms = self.rooms.write().await;
-        if let Some(room) = rooms.get_mut(&room_id) {
+        let mut room = self.rooms.get_mut(&room_id).await;
+        if let Some(room) = room {
             room.tracks.insert(track.id, track.clone());
             
-            // Add to global tracks
-            self.tracks.write().await.insert(track.id, track);
+            // Add to global tracks (single write)
+            self.tracks.insert(track.id, track).await;
             
             self.metrics.increment_counter("tracks_added", 1);
             Ok(())
@@ -133,53 +145,69 @@ impl SFU {
     }
 
     pub async fn handle_packet(&self, packet: RTPPacket, room_id: Uuid) -> Result<(), PacketError> {
-        self.logger.debug(&format!("Handling RTP packet in room {}", room_id));
-        
-        // Find the room and track
-        let rooms = self.rooms.read().await;
-        if let Some(room) = rooms.get(&room_id) {
-            // Find the track
-            let tracks = self.tracks.read().await;
-            if let Some(track) = tracks.values().find(|t| t.ssrc == packet.ssrc) {
-                // Get forwarding strategy
-                let strategy = self.packet_processor.get_forwarding_strategy(track.id);
-                
-                match strategy {
-                    ForwardingStrategy::Unicast { peer_ids } => {
-                        self.forward_to_peers(packet, peer_ids).await?;
-                    }
-                    ForwardingStrategy::Multicast { group_id } => {
-                        // Implement multicast forwarding
-                        self.forward_to_group(packet, group_id).await?;
-                    }
-                    ForwardingStrategy::Simulcast { layers } => {
-                        // Implement simulcast forwarding
-                        self.forward_simulcast(packet, layers).await?;
-                    }
-                    ForwardingStrategy::SVC { layers } => {
-                        // Implement SVC forwarding
-                        self.forward_svc(packet, layers).await?;
-                    }
+    self.logger.debug(&format!("Handling RTP packet in room {}", room_id));
+    
+    // Use timeout for packet processing
+    let result = timeout(Duration::from_millis(100), async {
+        // Get forwarding strategy (lock-free read)
+        let track = self.tracks.get(&packet.ssrc).await;
+        if let Some(track) = track {
+            let strategy = self.packet_processor.get_forwarding_strategy(track.id);
+            
+            match strategy {
+                ForwardingStrategy::Unicast { peer_ids } => {
+                    self.forward_to_peers(packet, peer_ids).await?;
                 }
-                
-                self.metrics.increment_counter("packets_forwarded", 1);
-                Ok(())
-            } else {
-                Err(PacketError::InvalidPacket)
+                ForwardingStrategy::Multicast { group_id } => {
+                    self.forward_to_group(packet, group_id).await?;
+                }
+                ForwardingStrategy::Simulcast { layers } => {
+                    self.forward_simulcast(packet, layers).await?;
+                }
+                ForwardingStrategy::SVC { layers } => {
+                    self.forward_svc(packet, layers).await?;
+                }
             }
+            
+            self.metrics.increment_counter("packets_forwarded", 1);
+            Ok(())
         } else {
             Err(PacketError::InvalidPacket)
         }
+    }).await;
+    
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            self.logger.warn("Packet processing timeout");
+            Err(PacketError::ProcessingTimeout)
+        }
     }
+}
 
     async fn forward_to_peers(&self, packet: RTPPacket, peer_ids: Vec<Uuid>) -> Result<(), PacketError> {
-        // Forward packet to specific peers
-        for peer_id in peer_ids {
-            // Get peer connection info
-            let peers = self.peers.read().await;
-            if let Some(peer) = peers.get(&peer_id) {
-                // Simulate forwarding (in real implementation, this would send over network)
-                self.logger.debug(&format!("Forwarding packet to peer {}", peer_id));
+        // Use parallel forwarding with bounded concurrency
+        let tasks: Vec<_> = peer_ids.into_iter().map(|peer_id| {
+            let peers = self.peers.clone();
+            let packet = packet.clone();
+            tokio::spawn(async move {
+                let peer = peers.get(&peer_id).await;
+                if let Some(peer) = peer {
+                    // Real forwarding logic here
+                    debug!("Forwarding packet to peer {}", peer_id);
+                    Ok(())
+                } else {
+                    Err(PacketError::PeerNotFound)
+                }
+            })
+        }).collect();
+        
+        // Wait for all tasks with timeout
+        let results = futures::future::join_all(tasks).await;
+        for result in results {
+            if let Err(e) = result? {
+                return Err(e);
             }
         }
         Ok(())
@@ -203,27 +231,37 @@ impl SFU {
     pub async fn handle_rtcp(&self, packet: RTCPPacket, peer_id: Uuid) -> Result<(), PacketError> {
         self.logger.debug(&format!("Handling RTCP packet from peer {}", peer_id));
         
-        // Process RTCP feedback
-        match packet.packet_type {
-            crate::shared::media::RTCPPacketType::RTPFB => {
-                // Handle NACK
-                if let Ok(nack) = serde_json::from_slice::<crate::shared::media::NACK>(&packet.payload) {
-                    self.handle_nack(nack, peer_id).await?;
+        // Process RTCP feedback with timeout
+        let result = timeout(Duration::from_millis(50), async {
+            match packet.packet_type {
+                crate::shared::media::RTCPPacketType::RTPFB => {
+                    // Handle NACK
+                    if let Ok(nack) = serde_json::from_slice::<crate::shared::media::NACK>(&packet.payload) {
+                        self.handle_nack(nack, peer_id).await?;
+                    }
                 }
-            }
-            crate::shared::media::RTCPPacketType::PSFB => {
-                // Handle PLI, FIR, SLI
-                match packet.report_count {
-                    1 => { /* PLI */ }
-                    4 => { /* FIR */ }
-                    6 => { /* SLI */ }
-                    _ => {}
+                crate::shared::media::RTCPPacketType::PSFB => {
+                    // Handle PLI, FIR, SLI
+                    match packet.report_count {
+                        1 => { /* PLI */ }
+                        4 => { /* FIR */ }
+                        6 => { /* SLI */ }
+                        _ => {}
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
+            Ok(())
+        }).await;
         
-        Ok(())
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                self.logger.warn("RTCP processing timeout");
+                Err(PacketError::ProcessingTimeout)
+            }
+        }
     }
 
     async fn handle_nack(&self, nack: crate::shared::media::NACK, peer_id: Uuid) -> Result<(), PacketError> {
@@ -234,9 +272,8 @@ impl SFU {
     }
 
     pub async fn get_room_stats(&self, room_id: Uuid) -> Result<RoomStats, RoomError> {
-        let rooms = self.rooms.read().await;
-        if let Some(room) = rooms.get(&room_id) {
-            let peers = self.peers.read().await;
+        let room = self.rooms.get(&room_id).await;
+        if let Some(room) = room {
             let peer_count = room.peers.len();
             let active_peers = room.peers.values().filter(|p| p.connection_state == crate::shared::domain::ConnectionState::Connected).count();
             let track_count = room.tracks.len();

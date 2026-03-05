@@ -10,3 +10,7 @@ log = "0.4"
 
 [dependencies.shared]
 path = "../../shared"
+
+[[bin]]
+name = "drmp-gateway"
+path = "src/main.rs"

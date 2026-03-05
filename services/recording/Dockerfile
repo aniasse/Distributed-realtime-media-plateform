@@ -6,14 +6,13 @@ WORKDIR /app
 RUN apk add --no-cache musl-dev openssl-dev cargo
 
 # Copy Cargo files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Create a dummy src directory to build dependencies
 RUN mkdir -p src/bin
-RUN echo 'fn main() {}' > src/bin/dummy.rs
 
 # Build dependencies only
-RUN cargo build --release --bin dummy
+RUN mkdir -p src/bin && echo 'fn main() {}' > src/bin/dummy.rs && cargo build --release --bin dummy
 
 # Remove dummy file
 RUN rm -f src/bin/dummy.rs
