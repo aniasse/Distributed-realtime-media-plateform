@@ -431,7 +431,7 @@ impl ErrorResponseBuilder {
     }
 
     pub fn with_retryable(mut self, retryable: bool) -> Self {
-        self.error = self.error.with_retryable(retryable);
+        self.error = self.error.with_retryable(retable);
         self
     }
 
