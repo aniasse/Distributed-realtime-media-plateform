@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sfu
+  namespace: drmp
+  labels:
+    app: sfu
+    tier: core
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sfu
+  template:
+    metadata:
+      labels:
+        app: sfu
+        tier: core
+    spec:
+      containers:
+      - name: sfu
+        image: drmp/sfu:latest
+        ports:
+        - containerPort: 5004
+          name: media
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: DATABASE_URL
+          value: "postgresql://postgres:password@postgres:5432/drmp"
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sfu
+  namespace: drmp
+  labels:
+    app: sfu
+    tier: core
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5004
+    targetPort: 5004
+    name: media
+  selector:
+    app: sfu

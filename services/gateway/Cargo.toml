@@ -1,0 +1,12 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.0"
+actix-rt = "2.0"
+log = "0.4"
+
+[dependencies.shared]
+path = "../../shared"

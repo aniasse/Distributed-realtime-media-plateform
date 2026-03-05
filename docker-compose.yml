@@ -1,0 +1,186 @@
+version: '3.8'
+
+services:
+  # Media Edge Service - RTMP + WebRTC Ingress
+  media-edge:
+    build: ./services/media-edge
+    ports:
+      - "1935:1935"  # RTMP port
+      - "8081:8081"  # WebRTC port
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/drmp
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # SFU Service - Core Media Processing
+  sfu:
+    build: ./services/sfu
+    ports:
+      - "5004:5004"  # Media forwarding port
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/drmp
+    depends_on:
+      - postgres
+      - redis
+      - media-edge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Control Plane Service - Room & Tenant Management
+  control-plane:
+    build: ./services/control-plane
+    ports:
+      - "8080:8080"  # REST API
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/drmp
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Recording Service - Media Storage
+  recording:
+    build: ./services/recording
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/drmp
+      - STORAGE_PATH=/recordings
+    volumes:
+      - recordings:/recordings
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Auth Service - Authentication & RBAC
+  auth:
+    build: ./services/auth
+    ports:
+      - "8081:8080"  # Auth API
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/drmp
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Gateway Service - API Routing
+  gateway:
+    build: ./services/gateway
+    ports:
+      - "8888:8080"  # Public API gateway
+    environment:
+      - RUST_LOG=debug
+    depends_on:
+      - media-edge
+      - sfu
+      - control-plane
+      - recording
+      - auth
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Database - PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=drmp
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    restart: unless-stopped
+
+  # Cache - Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Monitoring - Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+
+  # Monitoring - Grafana
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Metrics Exporter - Node Exporter
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  recordings:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drmp-config
+  namespace: drmp
+data:
+  # Database configuration
+  DATABASE_URL: "postgresql://postgres:password@postgres:5432/drmp"
+  
+  # Redis configuration
+  REDIS_URL: "redis://redis:6379"
+  
+  # Media configuration
+  MAX_PARTICIPANTS: "100"
+  MAX_BANDWIDTH_MBPS: "10"
+  
+  # Recording configuration
+  RECORDING_STORAGE_PATH: "/recordings"
+  RECORDING_RETENTION_DAYS: "30"
+  
+  # Auth configuration
+  JWT_SECRET: "your-super-secret-jwt-key-change-in-production"
+  TOKEN_EXPIRY_HOURS: "24"
+  
+  # Gateway configuration
+  GATEWAY_PORT: "8080"
+  GATEWAY_HOST: "0.0.0.0"
+  
+  # Logging configuration
+  RUST_LOG: "info"
+  LOG_LEVEL: "info"
+  
+  # Monitoring configuration
+  METRICS_PORT: "9090"
+  PROMETHEUS_SCRAPE_INTERVAL: "30s"
