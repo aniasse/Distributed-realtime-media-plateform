@@ -39,20 +39,12 @@ impl MediaEdge {
         }
     }
 
-    pub async fn start(&self) -> Result<(), std::io::Error> {
+    pub async fn start(&mut self) -> Result<(), std::io::Error> {
         self.logger.info("Starting Media Edge service");
         
         // Start RTMP listener
-        let rtmp_listener = TcpListener::bind("0.0.0.0:1935").await?;
-        self.logger.info("RTMP listener started on port 1935");
-        
-        // Start WebRTC listener
-        let webrtc_listener = TcpListener::bind("0.0.0.0:8081").await?;
-        self.logger.info("WebRTC listener started on port 8081");
-        
-        // Handle incoming connections
-        tokio::spawn(self.handle_rtmp_connections(rtmp_listener));
-        tokio::spawn(self.handle_webrtc_connections(webrtc_listener));
+        self.start_rtmp_listener(1935).await?;
+        self.start_webrtc_listener(8081).await?;
         
         Ok(())
     }
