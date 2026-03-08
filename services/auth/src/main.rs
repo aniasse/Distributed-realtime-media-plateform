@@ -1,12 +1,11 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, HttpMessage, http::StatusCode};
-use actix_rt::System;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use sqlx::PgPool;
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use serde_json::json;
+use log::{info, error};
 
-use crate::lib::{AuthService, AuthError};
+mod lib;
+use crate::lib::{AuthService};
 
 #[derive(Serialize, Deserialize)]
 pub struct LoginRequest {

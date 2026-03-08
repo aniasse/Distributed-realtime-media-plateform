@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: drmp
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+
+  sfu:
+    build:
+      context: .
+      dockerfile: services/sfu/Dockerfile.dev
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db:5432/drmp
+      - RUST_LOG=info
+    ports:
+      - "5004:5004"
+      - "10000-10010:10000-10010/udp" # Plage UDP pour WebRTC
+    depends_on:
+      - db
+    volumes:
+      - .:/usr/src/app

@@ -1,49 +1,61 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, HttpMessage, http::StatusCode};
-use actix_rt::System;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
+use serde_json::json;
+use log::{info};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::lib::{Gateway, ServiceInfo};
+mod lib;
+use crate::lib::{Gateway};
+use shared::security::{AuthProvider, AuthError, User, Role};
 
-#[derive(Serialize, Deserialize)]
-pub struct ServiceStatus {
-    pub service_name: String,
-    pub status: String,
-    pub endpoint: String,
-    pub version: String,
-    pub uptime: u64,
-}
+struct SimpleAuthProvider;
 
-#[derive(Serialize, Deserialize)]
-pub struct ServicesStatus {
-    pub services: Vec<ServiceStatus>,
-    pub overall_status: String,
+impl AuthProvider for SimpleAuthProvider {
+    fn authenticate(&self, _username: &str, _password: &str) -> Result<User, AuthError> {
+        Err(AuthError::InvalidCredentials)
+    }
+    fn validate_token(&self, _token: &str) -> Result<User, AuthError> {
+        Ok(User {
+            id: uuid::Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@drmp.com".to_string(),
+            roles: vec![Role::SuperAdmin],
+            tenant_id: None,
+            created_at: chrono::Utc::now(),
+        })
+    }
+    fn authorize(&self, _user: &User, _resource: &str, _action: &str) -> Result<bool, AuthError> {
+        Ok(true)
+    }
+    fn create_token(&self, _user: &User) -> Result<String, AuthError> {
+        Ok("dummy_token".to_string())
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     
-    let gateway = Gateway::new();
+    let auth_provider = Box::new(SimpleAuthProvider);
+    let gateway = Arc::new(Gateway::new(auth_provider));
     
     info!("Starting Gateway service on port 8888");
     
     HttpServer::new(move || {
+        let gateway = gateway.clone();
         App::new()
-            .app_data(web::Data::new(gateway.clone()))
+            .app_data(web::Data::new(gateway))
             .service(
                 web::resource("/api/status")
                     .route(web::get().to(get_status))
             )
             .service(
-                web::resource("/api/services")
-                    .route(web::get().to(get_services))
-            )
-            .service(
                 web::resource("/api/health")
                     .route(web::get().to(health_check))
+            )
+            .service(
+                web::resource("/api/{service}/{endpoint}")
+                    .route(web::post().to(crate::lib::route_request_handler))
             )
     })
     .bind("0.0.0.0:8888")?
@@ -51,73 +63,14 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn get_status(
-    gateway: web::Data<Gateway>,
-) -> impl Responder {
-    match gateway.get_status().await {
-        Ok(status) => {
-            info!("Gateway status retrieved");
-            HttpResponse::Ok().json(status)
-        }
-        Err(e) => {
-            error!("Failed to get gateway status: {}", e);
-            HttpResponse::InternalServerError().json(json!({ "error": format!("{:?}", e) }))
-        }
-    }
+async fn get_status() -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "service": "gateway",
+        "status": "healthy",
+        "version": "0.1.0"
+    }))
 }
 
-async fn get_services(
-    gateway: web::Data<Gateway>,
-) -> impl Responder {
-    match gateway.get_services().await {
-        Ok(services) => {
-            info!("Services retrieved");
-            let service_statuses: Vec<ServiceStatus> = services
-                .into_iter()
-                .map(|s| ServiceStatus {
-                    service_name: s.service_name,
-                    status: s.status,
-                    endpoint: s.endpoint,
-                    version: s.version,
-                    uptime: s.uptime,
-                })
-                .collect();
-            
-            let overall_status = if service_statuses.iter().all(|s| s.status == "healthy") {
-                "healthy".to_string()
-            } else {
-                "degraded".to_string()
-            };
-            
-            let response = ServicesStatus {
-                services: service_statuses,
-                overall_status,
-            };
-            
-            HttpResponse::Ok().json(response)
-        }
-        Err(e) => {
-            error!("Failed to get services: {}", e);
-            HttpResponse::InternalServerError().json(json!({ "error": format!("{:?}", e) }))
-        }
-    }
-}
-
-async fn health_check(
-    gateway: web::Data<Gateway>,
-) -> impl Responder {
-    match gateway.health_check().await {
-        Ok(healthy) => {
-            if healthy {
-                info!("Health check passed");
-                HttpResponse::Ok().json(json!({ "status": "healthy" }))
-            } else {
-                HttpResponse::ServiceUnavailable().json(json!({ "status": "unhealthy" }))
-            }
-        }
-        Err(e) => {
-            error!("Health check failed: {}", e);
-            HttpResponse::ServiceUnavailable().json(json!({ "status": "unhealthy", "error": format!("{:?}", e) }))
-        }
-    }
+async fn health_check(gateway: web::Data<Arc<Gateway>>) -> impl Responder {
+    gateway.health_check().await
 }

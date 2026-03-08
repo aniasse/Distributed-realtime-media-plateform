@@ -1,43 +1,45 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, HttpMessage, http::StatusCode};
-use actix_rt::System;
-use sqlx::PgPool;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
+use serde_json::json;
+use log::{info, error};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use sqlx::PgPool;
 
-use crate::lib::{SFU, RoomError, PacketError};
+// Use the library crate name instead of mod lib
+use sfu::{SFU};
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateRoomRequest {
-    pub tenant_id: uuid::Uuid,
+    pub tenant_id: Uuid,
     pub max_participants: u32,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct RoomResponse {
-    pub room_id: uuid::Uuid,
-    pub tenant_id: uuid::Uuid,
+    pub room_id: Uuid,
+    pub tenant_id: Uuid,
     pub max_participants: u32,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct AddPeerRequest {
-    pub room_id: uuid::Uuid,
-    pub peer_id: uuid::Uuid,
+    pub room_id: Uuid,
+    pub peer_id: Uuid,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct AddTrackRequest {
-    pub room_id: uuid::Uuid,
+    pub room_id: Uuid,
     pub track: Track,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Track {
-    pub id: uuid::Uuid,
-    pub publisher_id: uuid::Uuid,
+    pub id: Uuid,
+    pub publisher_id: Uuid,
     pub kind: String,
     pub ssrc: u32,
     pub media_info: MediaInfo,
@@ -62,20 +64,23 @@ pub struct RTPPacket {
 
 #[derive(Serialize, Deserialize)]
 pub struct RoomStats {
-    pub room_id: uuid::Uuid,
+    pub room_id: Uuid,
     pub peer_count: u32,
     pub active_peers: u32,
     pub track_count: u32,
     pub max_participants: u32,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:password@localhost/drmp".to_string());
+    let db_pool = PgPool::connect(&database_url).await.expect("Failed to connect to database");
+    
     let packet_processor = MockPacketProcessor::new();
-    let sfu = SFU::new(packet_processor);
+    let sfu = SFU::new(db_pool, Box::new(packet_processor));
     
     info!("Starting SFU service on port 5004");
     
@@ -102,6 +107,14 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/api/rooms/{room_id}/stats")
                     .route(web::get().to(get_room_stats))
             )
+            .service(
+                web::resource("/api/publish")
+                    .route(web::post().to(publish_packet))
+            )
+            .service(
+                web::resource("/ws")
+                    .route(web::get().to(sfu::signaling::ws_endpoint))
+            )
     })
     .bind("0.0.0.0:5004")?
     .run()
@@ -119,7 +132,7 @@ async fn create_room(
                 room_id: room_id.0,
                 tenant_id: form.tenant_id,
                 max_participants: form.max_participants,
-                created_at: chrono::Utc::now(),
+                created_at: Utc::now(),
             };
             HttpResponse::Created().json(response)
         }
@@ -132,9 +145,10 @@ async fn create_room(
 
 async fn delete_room(
     sfu: web::Data<SFU>,
-    room_id: web::Path<uuid::Uuid>,
+    room_id_path: web::Path<Uuid>,
 ) -> impl Responder {
-    match sfu.delete_room(room_id.into_inner()).await {
+    let room_id = room_id_path.into_inner();
+    match sfu.delete_room(room_id).await {
         Ok(_) => {
             info!("Room deleted: {}", room_id);
             HttpResponse::NoContent().finish()
@@ -150,7 +164,8 @@ async fn add_peer(
     sfu: web::Data<SFU>,
     form: web::Json<AddPeerRequest>,
 ) -> impl Responder {
-    match sfu.add_peer(form.room_id, form.peer_id).await {
+    let transport = Arc::new(MockTransport);
+    match sfu.add_peer(form.room_id, form.peer_id, transport).await {
         Ok(_) => {
             info!("Peer added to room: {}", form.peer_id);
             HttpResponse::NoContent().finish()
@@ -163,29 +178,18 @@ async fn add_peer(
 }
 
 async fn add_track(
-    sfu: web::Data<SFU>,
-    form: web::Json<AddTrackRequest>,
+    _sfu: web::Data<SFU>,
+    _form: web::Json<AddTrackRequest>,
 ) -> impl Responder {
-    let track = form.track.clone();
-    track.id = uuid::Uuid::new_v4();
-    
-    match sfu.add_track(form.room_id, track).await {
-        Ok(_) => {
-            info!("Track added to room");
-            HttpResponse::NoContent().finish()
-        }
-        Err(e) => {
-            error!("Failed to add track: {}", e);
-            HttpResponse::BadRequest().json(json!({ "error": format!("{:?}", e) }))
-        }
-    }
+    HttpResponse::NotImplemented().finish()
 }
 
 async fn get_room_stats(
     sfu: web::Data<SFU>,
-    room_id: web::Path<uuid::Uuid>,
+    room_id_path: web::Path<Uuid>,
 ) -> impl Responder {
-    match sfu.get_room_stats(room_id.into_inner()).await {
+    let room_id = room_id_path.into_inner();
+    match sfu.get_room_stats(room_id).await {
         Ok(stats) => {
             info!("Room stats retrieved: {}", room_id);
             HttpResponse::Ok().json(stats)
@@ -197,6 +201,27 @@ async fn get_room_stats(
     }
 }
 
+async fn publish_packet(
+    sfu: web::Data<SFU>,
+    packet: web::Json<RTPPacket>,
+) -> impl Responder {
+    let domain_packet = shared::media::RTPPacket {
+        ssrc: packet.ssrc,
+        sequence_number: packet.sequence_number,
+        timestamp: packet.timestamp,
+        payload_type: 96,
+        payload: packet.payload.clone(),
+        marker: packet.marker,
+        extension: None,
+    };
+
+    match sfu.publish_rtp(domain_packet).await {
+        Ok(_) => HttpResponse::Accepted().finish(),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": format!("{:?}", e) })),
+    }
+}
+
+#[derive(Clone)]
 struct MockPacketProcessor;
 
 impl MockPacketProcessor {
@@ -205,14 +230,32 @@ impl MockPacketProcessor {
     }
 }
 
-impl crate::shared::media::PacketProcessor for MockPacketProcessor {
-    fn process_rtp(&self, _packet: crate::shared::media::RTPPacket) -> Result<(), crate::shared::media::PacketError> {
+impl shared::media::PacketProcessor for MockPacketProcessor {
+    fn process_rtp(&self, _packet: shared::media::RTPPacket) -> Result<(), shared::media::PacketError> {
         Ok(())
     }
-    fn process_rtcp(&self, _packet: crate::shared::media::RTCPPacket) -> Result<(), crate::shared::media::PacketError> {
+    fn process_rtcp(&self, _packet: shared::media::RTCPPacket) -> Result<(), shared::media::PacketError> {
         Ok(())
     }
-    fn get_forwarding_strategy(&self, _track_id: uuid::Uuid) -> crate::shared::media::ForwardingStrategy {
-        crate::shared::media::ForwardingStrategy::Unicast { peer_ids: vec![] }
+    fn get_forwarding_strategy(&self, _track_id: Uuid) -> shared::media::ForwardingStrategy {
+        shared::media::ForwardingStrategy::Unicast { peer_ids: vec![] }
+    }
+}
+
+struct MockTransport;
+
+impl shared::media::Transport for MockTransport {
+    fn send_packet(&self, packet: shared::media::RTPPacket) -> Result<(), shared::media::TransportError> {
+        info!("Transport: Sending packet SSRC={} Seq={}", packet.ssrc, packet.sequence_number);
+        Ok(())
+    }
+    fn receive_packet(&self) -> Result<shared::media::RTPPacket, shared::media::TransportError> {
+        Err(shared::media::TransportError::Timeout)
+    }
+    fn send_rtcp(&self, _packet: shared::media::RTCPPacket) -> Result<(), shared::media::TransportError> {
+        Ok(())
+    }
+    fn receive_rtcp(&self) -> Result<shared::media::RTCPPacket, shared::media::TransportError> {
+        Err(shared::media::TransportError::Timeout)
     }
 }

@@ -3,10 +3,9 @@ use sqlx::postgres::PgRow;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
-
-use crate::shared::security::{AuthProvider, AuthError, Role, User, Permission, RBAC, RoleDefinition};
-use crate::shared::utils::{Logger, Metrics, ErrorHandler};
+use log::{info, error, debug, warn};
+use shared::security::{AuthProvider, AuthError, Role, User, Permission, RBAC, RoleDefinition};
+use shared::utils::{Logger, Metrics, ErrorHandler, hash_password, verify_password};
 
 pub struct AuthService {
     pub db_pool: PgPool,
@@ -136,11 +135,11 @@ impl AuthService {
         Ok(())
     }
 
-    pub async fn register_user(&self, username: &str, email: &str, password: &str) -> Result<Uuid, AuthError> {
+pub async fn register_user(&self, username: &str, email: &str, password: &str) -> Result<Uuid, AuthError> {
         self.logger.info(&format!("Registering user: {}", username));
         
         // Hash password
-        let password_hash = crate::shared::utils::hash_password(password);
+        let password_hash = hash_password(password);
         
         // Insert user
         let user_id = Uuid::new_v4();
@@ -153,10 +152,16 @@ impl AuthService {
             .await;
         
         match result {
-            Ok(_) => {
+            Ok(_) >> {
                 self.metrics.increment_counter("users_registered", 1);
                 Ok(user_id)
             }
+            Err(e) >> {
+                self.error_handler.handle_error(&e, "register_user");
+                Err(AuthError::InternalError)
+            }
+        }
+    }
             Err(e) => {
                 self.error_handler.handle_error(&e, "register_user");
                 Err(AuthError::InternalError)
@@ -179,7 +184,7 @@ impl AuthService {
         };
         
         // Verify password
-        if !crate::shared::utils::verify_password(password, &user_row.password_hash) {
+        if !verify_password(password, &user_row.password_hash) {
             return Err(AuthError::InvalidCredentials);
         }
         

@@ -1,33 +1,35 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, HttpMessage, http::StatusCode};
-use actix_rt::System;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
+use serde_json::json;
+use log::{info, error};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
-use crate::lib::{RecordingService, RecordingError};
+mod lib;
+use crate::lib::{RecordingService, FileStorageBackend};
 
 #[derive(Serialize, Deserialize)]
 pub struct StartRecordingRequest {
-    pub room_id: uuid::Uuid,
+    pub room_id: Uuid,
     pub recording_name: String,
     pub recording_type: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct StopRecordingRequest {
-    pub room_id: uuid::Uuid,
+    pub room_id: Uuid,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct RecordingInfo {
-    pub id: uuid::Uuid,
-    pub room_id: uuid::Uuid,
+    pub id: Uuid,
+    pub room_id: Uuid,
     pub recording_name: String,
     pub recording_type: String,
     pub status: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub duration: Option?u32>,
+    pub created_at: DateTime<Utc>,
+    pub duration: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,13 +41,15 @@ pub struct ListRecordingsResponse {
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     
-    let recording_service = RecordingService::new("/recordings");
+    let storage = Box::new(FileStorageBackend { base_path: "./recordings".to_string() });
+    let recording_service = Arc::new(RecordingService::new(storage));
     
     info!("Starting Recording service on port 8082");
     
     HttpServer::new(move || {
+        let rs = recording_service.clone();
         App::new()
-            .app_data(web::Data::new(recording_service.clone()))
+            .app_data(web::Data::new(rs))
             .service(
                 web::resource("/api/rooms")
                     .route(web::post().to(start_recording))
@@ -65,7 +69,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn start_recording(
-    recording_service: web::Data<RecordingService>,
+    recording_service: web::Data<Arc<RecordingService>>,
     form: web::Json<StartRecordingRequest>,
 ) -> impl Responder {
     match recording_service.start_recording(
@@ -91,8 +95,8 @@ async fn start_recording(
 }
 
 async fn stop_recording(
-    recording_service: web::Data<RecordingService>,
-    room_id: web::Path<uuid::Uuid>,
+    recording_service: web::Data<Arc<RecordingService>>,
+    room_id: web::Path<Uuid>,
 ) -> impl Responder {
     match recording_service.stop_recording(room_id.into_inner()).await {
         Ok(duration) => {
@@ -111,7 +115,7 @@ async fn stop_recording(
 }
 
 async fn list_recordings(
-    recording_service: web::Data<RecordingService>,
+    recording_service: web::Data<Arc<RecordingService>>,
 ) -> impl Responder {
     match recording_service.list_recordings().await {
         Ok(recordings) => {
@@ -122,7 +126,7 @@ async fn list_recordings(
                     room_id: r.room_id,
                     recording_name: r.recording_name,
                     recording_type: r.recording_type,
-                    status: format!("{:?}", r.status),
+                    status: r.status,
                     created_at: r.created_at,
                     duration: r.duration,
                 }).collect(),

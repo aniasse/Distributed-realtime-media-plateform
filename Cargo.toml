@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "services/auth",
+    "services/control-plane",
+    "services/gateway",
+    "services/media-edge",
+    "services/recording",
+    "services/sfu",
+]
+
+[patch.crates-io]
+# Force stable versions for the whole workspace
+getrandom = { git = "https://github.com/rust-random/getrandom", tag = "v0.2.15" }
+time = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }

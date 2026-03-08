@@ -1,11 +1,15 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, HttpMessage, http::StatusCode};
-use actix_rt::System;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse};
 use serde::{Serialize, Deserialize};
-use log::{info, error, debug};
+use serde_json::json;
+use log::{info, error};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
-use crate::lib::{MediaEdge, MediaError};
+mod lib;
+use crate::lib::{MediaEdge};
+use shared::security::{AuthProvider, AuthError, User, Role};
+use shared::media::{Transport, RTPPacket, RTCPPacket, TransportError};
 
 #[derive(Serialize, Deserialize)]
 pub struct StartStreamRequest {
@@ -16,11 +20,6 @@ pub struct StartStreamRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct StopStreamRequest {
-    pub stream_key: String,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct StreamInfo {
     pub stream_key: String,
     pub stream_type: String,
@@ -28,7 +27,7 @@ pub struct StreamInfo {
     pub connected_peers: u32,
     pub bitrate: u32,
     pub resolution: (u32, u32),
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,17 +35,64 @@ pub struct ListStreamsResponse {
     pub streams: Vec<StreamInfo>,
 }
 
+struct SimpleAuthProvider;
+
+impl AuthProvider for SimpleAuthProvider {
+    fn authenticate(&self, _username: &str, _password: &str) -> Result<User, AuthError> {
+        Err(AuthError::InvalidCredentials)
+    }
+    fn validate_token(&self, _token: &str) -> Result<User, AuthError> {
+        Ok(User {
+            id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@drmp.com".to_string(),
+            roles: vec![Role::Admin],
+            tenant_id: None,
+            created_at: Utc::now(),
+        })
+    }
+    fn authorize(&self, _user: &User, _resource: &str, _action: &str) -> Result<bool, AuthError> {
+        Ok(true)
+    }
+    fn create_token(&self, _user: &User) -> Result<String, AuthError> {
+        Ok("dummy_token".to_string())
+    }
+    fn validate_stream_key(&self, _key: &str) -> bool {
+        true
+    }
+}
+
+struct MockTransport;
+
+impl Transport for MockTransport {
+    fn send_packet(&self, _packet: RTPPacket) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn receive_packet(&self) -> Result<RTPPacket, TransportError> {
+        Err(TransportError::Timeout)
+    }
+    fn send_rtcp(&self, _packet: RTCPPacket) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn receive_rtcp(&self) -> Result<RTCPPacket, TransportError> {
+        Err(TransportError::Timeout)
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     
-    let media_edge = MediaEdge::new();
+    let transport = Box::new(MockTransport);
+    let auth_provider = Box::new(SimpleAuthProvider);
+    let media_edge = Arc::new(MediaEdge::new(transport, auth_provider));
     
-    info!("Starting Media Edge service on ports 1935, 8081");
+    info!("Starting Media Edge service on port 8081");
     
     HttpServer::new(move || {
+        let me = media_edge.clone();
         App::new()
-            .app_data(web::Data::new(media_edge.clone()))
+            .app_data(web::Data::new(me))
             .service(
                 web::resource("/api/streams")
                     .route(web::post().to(start_stream))
@@ -63,7 +109,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn start_stream(
-    media_edge: web::Data<MediaEdge>,
+    media_edge: web::Data<Arc<MediaEdge>>,
     form: web::Json<StartStreamRequest>,
 ) -> impl Responder {
     match media_edge.start_stream(
@@ -88,7 +134,7 @@ async fn start_stream(
 }
 
 async fn stop_stream(
-    media_edge: web::Data<MediaEdge>,
+    media_edge: web::Data<Arc<MediaEdge>>,
     stream_key: web::Path<String>,
 ) -> impl Responder {
     match media_edge.stop_stream(&stream_key.into_inner()).await {
@@ -104,7 +150,7 @@ async fn stop_stream(
 }
 
 async fn list_streams(
-    media_edge: web::Data<MediaEdge>,
+    media_edge: web::Data<Arc<MediaEdge>>,
 ) -> impl Responder {
     match media_edge.list_streams().await {
         Ok(streams) => {
