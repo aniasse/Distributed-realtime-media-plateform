@@ -16,12 +16,10 @@ services:
     build:
       context: .
       dockerfile: services/sfu/Dockerfile.dev
+    network_mode: host # LA SOLUTION ULTIME POUR LE WEBRTC
     environment:
-      - DATABASE_URL=postgres://postgres:password@db:5432/drmp
+      - DATABASE_URL=postgres://postgres:password@localhost:5433/drmp
       - RUST_LOG=info
-    ports:
-      - "5004:5004"
-      - "10000-10010:10000-10010/udp" # Plage UDP pour WebRTC
     depends_on:
       - db
     volumes:

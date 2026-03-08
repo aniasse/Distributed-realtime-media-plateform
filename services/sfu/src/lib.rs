@@ -51,12 +51,9 @@ impl SFU {
         
         let mut s = SettingEngine::default();
         
-        // --- CONFIGURATION NAT 1:1 VITALE POUR DOCKER ---
-        // On force le SFU à annoncer 127.0.0.1 pour les connexions locales
+        // --- CONFIGURATION HOST ---
+        // On annonce localhost car on est en network_mode: host
         s.set_nat_1to1_ips(vec!["127.0.0.1".to_string()], ICECandidateType::Host);
-        
-        // Tentative de fixer la plage de ports UDP avec la signature correcte
-        let _ = s.set_ice_gatherer_port_range(10000, 10010);
 
         let api = webrtc::api::APIBuilder::new()
             .with_media_engine(m)
